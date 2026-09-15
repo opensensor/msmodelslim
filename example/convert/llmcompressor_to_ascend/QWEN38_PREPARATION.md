@@ -43,7 +43,8 @@ The launcher defaults to checking readiness. It does not start automatically.
 Prepared stages:
 
 1. CUDA sequential GPTQ, FP16, 128 calibration conversations of at most 1,024
-   tokens, 64 GiB CPU weight budget, routed experts only.
+   tokens, 64 GiB CPU weight budget, routed experts only. Paired perplexity on
+   32 held-out conversations runs immediately before and after quantization.
 2. CPU ModelSlim W8A8_DYNAMIC export, one worker and 1 GB output shards.
 3. Chunked exact comparison of all exported values against the compressed source.
 
@@ -67,3 +68,51 @@ command with `--run` executes the three stages in order with separate logs and a
 status JSON. Failed stages stop the sequence; partial directories require review
 and a fresh run path before retrying. No full-model calibration, held-out quality
 comparison or 310P serving validation has been completed by this preparation.
+
+## Held-out quality check
+
+`quantize_qwen38.py` accepts these additional arguments:
+
+```bash
+--quality-data /path/to/test_sft.jsonl \
+--quality-report-dir /path/to/fresh-quality-directory \
+--quality-samples 32 \
+--quality-sequence-length 1024 \
+--quality-logit-chunk-size 128
+```
+
+The prepared run uses the existing UltraChat `test_sft.jsonl`; calibration uses
+`train_sft.jsonl`. Both came from dataset revision
+`8049631c405ae6576f93f445c6b8166f76f5505a`. Tokenized duplicate inputs and shared
+prefixes truncated to either sequence limit are rejected before model loading,
+including duplicates within the test set. This is exact token checking, not
+semantic deduplication or a claim that the dataset was absent from pretraining.
+Preflight with the released tokenizer found 28,245 predicted test tokens across
+the 32 conversations and no rejected duplicates. The token hash and sample counts
+are recorded locally in `quality-data-preflight.json` beside the run commands.
+
+The evaluator reuses the CPU/disk-offloaded model and scores uncached sequences
+one at a time. It computes the vocabulary projection and cross-entropy in chunks
+of at most 128 positions rather than allocating full-sequence logits. It still
+executes a complete model pass per conversation: 32 samples before and after
+calibration add 64 forward passes and substantial disk reads. This setting limits
+logit memory, not attention/intermediate memory or total process RAM.
+
+The report directory must be fresh and separate from source, checkpoint output
+and offload directories. `before.json` is saved before quantization so it survives
+a later calibration failure. `after.json` and `comparison.json` are saved before
+checkpoint export. Reports include the exact token hash, token counts, per-sample
+negative log likelihood, aggregate perplexity, dtype, device and timing. The
+comparison is also embedded in `calibration_manifest.json` after successful export.
+
+The baseline must have no quantization attached. The quantized pass requires all
+routed expert projections to have enabled, frozen symmetric W8A8 quantization
+with dynamic INT8 inputs. Non-finite loss stops the run. Reports show the measured
+change without imposing an unvalidated quality threshold.
+
+This measures all-token text perplexity, including user and assistant tokens,
+using the local eager reference and compressed-tensors quantize/dequantize
+execution. It does not validate exported Ascend execution, long-context behavior,
+vision, MTP, generation quality or parity with the current IQ4_XS GGUF baseline.
+Tiny-model CPU/CUDA tests exercise the measurement and conversion path; full-model
+quality results remain pending the download and conversion run.

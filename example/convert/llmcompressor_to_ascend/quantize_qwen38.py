@@ -4,13 +4,59 @@ Uses the same arguments as quantize_w8a8.py. The architecture adapter is local,
 text-only and uncached; vision/MTP weights are preserved without calibration.
 """
 
+import argparse
 import hashlib
 import json
 import os
 import time
 from importlib.metadata import version
+from pathlib import Path
+from types import SimpleNamespace
 
-from quantize_w8a8 import GIB, parse_args
+from quantize_w8a8 import GIB, positive_int, read_calibration
+from quantize_w8a8 import parse_args as parse_common_args
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--quality-data", type=Path, help="Held-out JSONL for paired pre/post quantization perplexity")
+    parser.add_argument("--quality-report-dir", type=Path, help="Fresh directory outside model/output/offload paths")
+    parser.add_argument("--quality-samples", type=positive_int, default=32)
+    parser.add_argument("--quality-sequence-length", type=positive_int, default=1024)
+    parser.add_argument("--quality-logit-chunk-size", type=positive_int, default=128)
+    args = parse_common_args(argv, parser=parser)
+    try:
+        if bool(args.quality_data) != bool(args.quality_report_dir):
+            raise ValueError("--quality-data and --quality-report-dir must be provided together")
+        args.quality_records = []
+        if args.quality_data:
+            path = args.quality_report_dir.resolve()
+            for other in (args.model_path, args.save_path, args.offload_dir):
+                other = other.resolve()
+                if path == other or path in other.parents or other in path.parents:
+                    raise ValueError("quality report directory must not overlap model/output/offload paths")
+            if path.exists() and (not path.is_dir() or any(path.iterdir())):
+                raise ValueError("quality report directory must be empty")
+            args.quality_records = read_calibration(
+                SimpleNamespace(calibration_data=args.quality_data, samples=args.quality_samples)
+            )
+    except (ValueError, TypeError, OSError) as exc:
+        parser.error(str(exc))
+    return args
+
+
+def tokenize_records(tokenizer, records, sequence_length):
+    rows = []
+    for record in records:
+        text = record.get("text")
+        chat = not isinstance(text, str) or not text.strip()
+        if chat:
+            text = tokenizer.apply_chat_template(record["messages"], tokenize=False, add_generation_prompt=False)
+        tokens = tokenizer(text, truncation=True, max_length=sequence_length, add_special_tokens=not chat)
+        if len(tokens["input_ids"]) < 2:
+            raise ValueError("each sample must contain at least two tokens")
+        rows.append({"input_ids": tokens["input_ids"], "attention_mask": tokens["attention_mask"]})
+    return rows
 
 
 def quantize(args):
@@ -24,6 +70,7 @@ def quantize(args):
     from llmcompressor.modifiers.quantization import QuantizationModifier
     from qwen38.export import save_checkpoint
     from qwen38.model import load_model
+    from qwen38.quality import compare_reports, evaluate, require_held_out, write_report
     from transformers import AutoTokenizer, set_seed
 
     if args.ignore or args.sequential_target:
@@ -40,16 +87,10 @@ def quantize(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True, trust_remote_code=False)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    rows = []
-    for record in args.records:
-        text = record.get("text")
-        chat = not isinstance(text, str) or not text.strip()
-        if chat:
-            text = tokenizer.apply_chat_template(record["messages"], tokenize=False, add_generation_prompt=False)
-        tokens = tokenizer(text, truncation=True, max_length=args.sequence_length, add_special_tokens=not chat)
-        if len(tokens["input_ids"]) < 2:
-            raise ValueError("each sample must contain at least two tokens")
-        rows.append({"input_ids": tokens["input_ids"], "attention_mask": tokens["attention_mask"]})
+    rows = tokenize_records(tokenizer, args.records, args.sequence_length)
+    quality_rows = tokenize_records(tokenizer, args.quality_records, args.quality_sequence_length)
+    if quality_rows:
+        require_held_out(rows, quality_rows)
     args.offload_dir.mkdir(parents=True, exist_ok=True)
     model = load_model(
         args.model_path,
@@ -58,6 +99,10 @@ def quantize(args):
         device=args.device,
         cpu_budget_bytes=int(args.cpu_memory_gib * GIB),
     )
+    if quality_rows:
+        args.quality_report_dir.mkdir(parents=True, exist_ok=True)
+        before = evaluate(model, quality_rows, device=args.device, chunk_size=args.quality_logit_chunk_size)
+        write_report(args.quality_report_dir / "before.json", before)
     recipe = (GPTQModifier if args.method == "gptq" else QuantizationModifier)(
         scheme="W8A8", targets=[r"re:.*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)"]
     )
@@ -74,6 +119,14 @@ def quantize(args):
             "moe_calibrate_all_experts": True,
         }
     oneshot(model=model, tokenizer=tokenizer, recipe=recipe, output_dir=None, clear_sparse_session=True, **calibration)
+    quality = None
+    if quality_rows:
+        after = evaluate(
+            model, quality_rows, device=args.device, chunk_size=args.quality_logit_chunk_size, quantized=True
+        )
+        write_report(args.quality_report_dir / "after.json", after)
+        quality = compare_reports(before, after)
+        write_report(args.quality_report_dir / "comparison.json", quality)
     result = save_checkpoint(model, args.save_path, float_dtype=getattr(torch, args.dtype))
     result.update(
         method=args.method,
@@ -87,7 +140,8 @@ def quantize(args):
         calibration_samples=len(rows),
         calibration_tokens_sha256=hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest(),
         versions={name: version(name) for name in ("torch", "transformers", "llmcompressor", "compressed-tensors")},
-        validation="text calibration and compressed-tensors export; Ascend inference and quality not validated",
+        quality=quality,
+        validation="text calibration and compressed-tensors export; Ascend inference not validated",
         ple="source shards preserved; memory-mapped row lookup during calibration",
         vision="preserved, not calibrated",
         mtp="preserved in floating point, not calibrated or enabled",

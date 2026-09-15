@@ -32,8 +32,9 @@ def positive_gib(value):
     return number
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+def parse_args(argv=None, *, parser=None):
+    if parser is None:
+        parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--save-path", type=Path, required=True, help="Fresh compressed-tensors output directory")
     parser.add_argument("--offload-dir", type=Path, required=True, help="Fresh directory for disk offload; prefer NVMe")

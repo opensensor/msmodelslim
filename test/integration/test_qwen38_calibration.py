@@ -18,6 +18,7 @@ from qwen38.checkpoint import Checkpoint, MappedEmbedding
 from qwen38.configuration import Qwen4ExpTextConfig
 from qwen38.export import save_checkpoint
 from qwen38.model import Qwen38ForCalibration, load_model
+from qwen38.quality import check_quantization, compare_reports, evaluate, require_held_out
 from qwen38.reference import torch_chunk_gated_delta_rule, torch_recurrent_gated_delta_rule
 
 
@@ -248,12 +249,21 @@ def test_calibration_cli(source, tmp_path, method):
         data = tmp_path / "calibration.jsonl"
         data.write_text('{"text": "a b c a b c"}\n')
         arguments.extend(["--calibration-data", str(data), "--samples", "1", "--sequence-length", "8"])
+    quality = tmp_path / "quality.jsonl"
+    quality.write_text('{"text": "c b a c b a"}\n')
+    reports = tmp_path / "quality"
+    arguments.extend(["--quality-data", str(quality), "--quality-report-dir", str(reports), "--quality-samples", "1"])
     result = subprocess.run(arguments, capture_output=True, text=True, timeout=60, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads((output / "calibration_manifest.json").read_text())
     assert report["quantized_projections"] == 18
     assert report["method"] == method
     assert report["cuda_peak_allocated_bytes"] == 0
+    comparison = json.loads((reports / "comparison.json").read_text())
+    assert comparison == report["quality"]
+    assert comparison["before"]["quantized_projections"] == 0
+    assert comparison["after"]["quantized_projections"] == 18
+    assert comparison["before"]["predicted_tokens"] == comparison["after"]["predicted_tokens"] == 5
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -270,6 +280,8 @@ def test_sequential_gptq_export_and_native_bridge(source, tmp_path, device):
     directory, _, weights = source
     dtype = torch.float16 if device == "cuda" else torch.float32
     model = load_model(directory, tmp_path / "offload", dtype=dtype, device=device, cpu_budget_bytes=0)
+    held_out = [{"input_ids": [9, 8, 7, 6, 5, 4], "attention_mask": [1] * 6}]
+    before = evaluate(model, held_out, device=device, chunk_size=2)
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1}, unk_token="[UNK]")),
         unk_token="[UNK]",
@@ -291,6 +303,13 @@ def test_sequential_gptq_export_and_native_bridge(source, tmp_path, device):
         output_dir=None,
         clear_sparse_session=True,
     )
+    after = evaluate(model, held_out, device=device, chunk_size=2, quantized=True)
+    assert compare_reports(before, after)["after"]["quantized_projections"] == 18
+    expert = model.model.language_model.layers[0].mlp.experts[0].gate_proj
+    expert.quantization_enabled = False
+    with pytest.raises(ValueError, match="enabled and frozen"):
+        check_quantization(model, True)
+    expert.quantization_enabled = True
     compressed = tmp_path / "compressed"
     report = save_checkpoint(model, compressed, shard_bytes=20000, float_dtype=dtype)
     assert report["quantized_projections"] == 18
@@ -343,3 +362,86 @@ def test_sequential_gptq_export_and_native_bridge(source, tmp_path, device):
     assert result.returncode == 0, result.stdout + result.stderr
     with pytest.raises(ValueError, match="empty destination"):
         save_checkpoint(model, compressed)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 128])
+def test_quality_matches_full_logits_with_disk_offload(source, tmp_path, chunk_size):
+    directory, original, _ = source
+    loaded = load_model(directory, tmp_path / "offload", dtype=torch.float32, cpu_budget_bytes=0)
+    rows = [
+        {"input_ids": [3, 4, 5, 6, 7, 8], "attention_mask": [1] * 6},
+        {"input_ids": [8, 7, 6, 5], "attention_mask": [1] * 4},
+    ]
+    expected = 0
+    with torch.no_grad():
+        for row in rows:
+            inputs = torch.tensor([row["input_ids"]])
+            expected += torch.nn.functional.cross_entropy(
+                original(inputs).logits[0, :-1].float(), inputs[0, 1:], reduction="sum"
+            ).item()
+    sizes = []
+    hook = loaded.lm_head.register_forward_pre_hook(lambda module, args: sizes.append(args[0].shape[1]))
+    loaded.train()
+    report = evaluate(loaded, rows, chunk_size=chunk_size)
+    hook.remove()
+    assert loaded.training
+    assert max(sizes) <= chunk_size
+    assert report["predicted_tokens"] == 8
+    assert report["mean_nll"] == pytest.approx(expected / 8, rel=1e-6)
+    mismatched = {**report, "quantized_projections": 18, "token_ids_sha256": "different"}
+    with pytest.raises(ValueError, match="token_ids_sha256"):
+        compare_reports(report, mismatched)
+    with pytest.raises(ValueError, match="expected 18"):
+        evaluate(loaded, rows, quantized=True)
+    with pytest.raises(ValueError, match="unpadded"):
+        evaluate(loaded, [{"input_ids": [3, 4], "attention_mask": [1, 0]}])
+    assert loaded.training
+
+
+def test_quality_rejects_nonfinite_loss(source):
+    _, model, _ = source
+    with torch.no_grad():
+        model.lm_head.weight.fill_(float("nan"))
+    with pytest.raises(ValueError, match="non-finite evaluation loss"):
+        evaluate(model, [{"input_ids": [3, 4, 5], "attention_mask": [1] * 3}])
+
+
+def test_quality_rejects_token_leakage():
+    calibration = [{"input_ids": [1, 2, 3]}]
+    for ids in ([1, 2, 3], [1, 2], [1, 2, 3, 4]):
+        with pytest.raises(ValueError, match="duplicate"):
+            require_held_out(calibration, [{"input_ids": ids}])
+    require_held_out(calibration, [{"input_ids": [1, 2, 4]}])
+    with pytest.raises(ValueError, match="duplicate"):
+        require_held_out([], calibration * 2)
+
+
+def test_quality_cli_validates_before_loading(source, tmp_path):
+    from quantize_qwen38 import parse_args
+
+    directory, _, _ = source
+    data = tmp_path / "test.jsonl"
+    data.write_text('{"text": "held out text"}\n')
+    arguments = [
+        "--model-path",
+        str(directory),
+        "--save-path",
+        str(tmp_path / "output"),
+        "--offload-dir",
+        str(tmp_path / "offload"),
+        "--method",
+        "rtn",
+        "--quality-data",
+        str(data),
+        "--quality-samples",
+        "1",
+    ]
+    with pytest.raises(SystemExit):
+        parse_args(arguments)
+    with pytest.raises(SystemExit):
+        parse_args([*arguments, "--quality-report-dir", str(directory / "quality")])
+    with pytest.raises(SystemExit):
+        parse_args([*arguments, "--quality-report-dir", str(tmp_path / "quality"), "--quality-samples", "2"])
+    args = parse_args([*arguments, "--quality-report-dir", str(tmp_path / "quality")])
+    assert args.quality_records == [{"text": "held out text"}]
+    assert not args.offload_dir.exists()
