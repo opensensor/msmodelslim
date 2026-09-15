@@ -13,9 +13,12 @@ from pathlib import Path
 from typing import List, Literal, Optional
 
 from msmodelslim.core.const import DeviceType
+from msmodelslim.core.convert.types import IRKind
 from msmodelslim.core.quant_service.interface import BaseQuantConfig, IQuantService, QuantServiceConfig
+from msmodelslim.core.quant_service.modelslim_convert.impl.int8_source import validate_int8_destination
 from msmodelslim.model import IModel
 from msmodelslim.utils.logging import get_logger, logger_setter
+
 from .config_mapper import spec_to_convert_config
 from .factory import create_convert_application
 from .quant_config import ModelslimConvertQuantConfig
@@ -78,7 +81,10 @@ class ModelslimConvertQuantService(IQuantService):
             )
         # save_path 已禁止落在源模型目录内，此处清掉旧分片以免总数变化后残留同名/旧序号文件。
         # 先删后转，转换失败会留下空目录/旧输出，需由用户在全新 save_path 上重跑。
-        if save_path.exists():
+        int8_import = any(r.target_ir == IRKind.W8A8_DYNAMIC for r in convert_config.convert_rules)
+        if int8_import:
+            validate_int8_destination(convert_config)
+        if save_path.exists() and not int8_import:
             for item in save_path.iterdir():
                 if item.is_file() and item.suffix == ".safetensors":
                     item.unlink()

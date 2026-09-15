@@ -1,3 +1,5 @@
+> OpenSensor development fork: [CPU checkpoint conversion for Ascend 310P](example/convert/llmcompressor_to_ascend/README.md). Upstream: [Ascend/msmodelslim on GitCode](https://gitcode.com/Ascend/msmodelslim).
+
 <!-- md-trans-meta sourceCommit=652caa58cbf1feddc29ea6bd484adddf6557db00 translatedAt=2026-08-21T06:10:49.731Z pushedAt=2026-08-21T06:21:55.322Z -->
 
 <h1 align="center"> MindStudio ModelSlim</h1>

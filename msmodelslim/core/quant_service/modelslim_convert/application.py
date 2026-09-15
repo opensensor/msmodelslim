@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import time
 
-from tqdm import tqdm
 from torch import nn
+from tqdm import tqdm
 
 from msmodelslim.core.convert.config import ConvertConfig
 from msmodelslim.core.convert.device import (
@@ -29,6 +29,8 @@ from msmodelslim.core.convert.device import (
 from msmodelslim.core.convert.protocol import ConvertContext
 from msmodelslim.core.convert.router import IRRouter
 from msmodelslim.core.convert.tasks import RoutedTask
+from msmodelslim.core.convert.types import IRKind
+from msmodelslim.core.quant_service.modelslim_convert.impl.int8_source import validate_int8_source
 from msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter import SaveProcessorAdapter
 from msmodelslim.core.quant_service.modelslim_convert.virtual_module import (
     set_submodule_by_path,
@@ -100,6 +102,8 @@ class ConvertApplication:
         with tqdm(total=1, desc="read checkpoint index") as pbar:
             raw_catalog = reader.read_catalog()
             pbar.update(1)
+        if any(rule.target_ir == IRKind.W8A8_DYNAMIC for rule in config.convert_rules):
+            validate_int8_source(reader, raw_catalog, config)
         logger.info("Convert phase timing: read_index=%.2fs", time.perf_counter() - phase_t0)
 
         phase_t0 = time.perf_counter()

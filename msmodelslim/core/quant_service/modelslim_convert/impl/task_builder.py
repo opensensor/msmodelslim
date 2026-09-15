@@ -14,13 +14,14 @@ import fnmatch
 
 from torch import nn
 
-from msmodelslim.core.quant_service.modelslim_convert.virtual_module import ModelFreeLinear
 from msmodelslim.core.convert.auto_routes import resolve_auto_route
 from msmodelslim.core.convert.catalog import DependencyMap, TensorCatalog
 from msmodelslim.core.convert.config import ConvertRule
 from msmodelslim.core.convert.edges import RouteConstraints
 from msmodelslim.core.convert.protocol import ConvertContext, IRTaskBuilder
 from msmodelslim.core.convert.tasks import IRTask
+from msmodelslim.core.convert.types import IRKind
+from msmodelslim.core.quant_service.modelslim_convert.virtual_module import ModelFreeLinear
 
 
 class DefaultIRTaskBuilder(IRTaskBuilder):
@@ -41,6 +42,10 @@ class DefaultIRTaskBuilder(IRTaskBuilder):
                 continue
             rule = _match_convert_rule(name, context.config.convert_rules)
             if rule is None or rule.action != "transform":
+                continue
+            # A compressed-tensors import preserves all floating-point exclusions.
+            # The source preflight rejects unhandled quantized tensors before saving.
+            if rule.target_ir == IRKind.W8A8_DYNAMIC and mod.source_ir.kind == IRKind.FLOAT:
                 continue
             if mod.target_ir is None:
                 mod.target_ir = rule.target_ir

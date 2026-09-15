@@ -15,6 +15,7 @@ from msmodelslim.utils.exception import UnsupportedError
 
 # (src_ir, dst_ir) -> full route including both endpoints
 _BEST_ROUTES: dict[tuple[IRKind, IRKind], list[IRKind]] = {
+    (IRKind.INT8_PER_CHANNEL, IRKind.W8A8_DYNAMIC): [IRKind.INT8_PER_CHANNEL, IRKind.W8A8_DYNAMIC],
     (IRKind.FP8_BLOCK, IRKind.FLOAT): [IRKind.FP8_BLOCK, IRKind.FLOAT],
     (IRKind.INT4_PACKED, IRKind.FLOAT): [IRKind.INT4_PACKED, IRKind.FLOAT],
     (IRKind.FP8_BLOCK, IRKind.W8A8_MXFP8): [

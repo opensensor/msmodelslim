@@ -211,6 +211,15 @@ def _map_convert_ops(ops: List[ConvertOpConfig]) -> List[WeightOpConfig]:
 
 # 源 IR -> (source_format, 额外 tensor 绑定)。决定虚拟树如何绑定权重并供 router 选路。
 _SOURCE_IR_BINDINGS: Dict[IRKind, Tuple[str, Dict[str, str]]] = {
+    IRKind.INT8_PER_CHANNEL: (
+        "compressed_tensors",
+        {
+            "weight": "{module}.weight",
+            "weight_scale": "{module}.weight_scale",
+            "weight_zero_point": "{module}.weight_zero_point",
+            "bias": "{module}.bias",
+        },
+    ),
     IRKind.FP8_BLOCK: (
         "fp8_block",
         {"weight": "{module}.weight", "weight_scale_inv": "{module}.weight_scale_inv"},
@@ -262,6 +271,8 @@ def _linears_to_module_and_convert_rules(
     convert_rules: List[ConvertRule] = []
     for linear in linears:
         source_format, source_ir, tensor_map = _module_rule_fields_for_route(linear.route)
+        if linear.target == IRKind.W8A8_DYNAMIC and linear.route == "auto":
+            tensor_map = dict(_SOURCE_IR_BINDINGS[IRKind.INT8_PER_CHANNEL][1])
         for pattern in linear.match:
             module_rules.append(
                 ModuleRule(
