@@ -79,14 +79,17 @@ Ascend branch. The NVIDIA PLE offload uses pinned host memory, CUDA UVA,
 cache handling and FlashAttention backend. A generic offload flag cannot supply
 a 310P implementation of these paths.
 
-The current ModelSlim CPU/CUDA environment does not contain the Qwen4Exp
-Transformers model implementation, and the pinned LLM-Compressor checkout has
-no Qwen4Exp-specific linearization mapping. The existing calibration command
-therefore cannot yet accept this checkpoint. The bridge also does not interpret
-fused 3D experts or quantized embedding tables as native supported inputs.
+The installed Transformers remains pinned. A dedicated local
+[text calibration adapter](QWEN38_CALIBRATION.md) now provides eager Qwen4Exp
+operations, fused-to-linear expert loading and file-backed PLE lookup. It feeds
+ordinary 2D expert projections to the existing bridge. Native Ascend kernels and
+quantized embedding tables are separate work; this calibration reference does
+not implement either.
 
-1. Implement bounded expert unpacking and reference model/calibration loading;
-   preserve gate/up ordering, router tensors and the four-branch residual layout.
+1. Bounded expert unpacking and text reference/calibration loading are implemented.
+   Small CPU/CUDA GPTQ and native export tests pass, as does a real first-layer
+   expert pilot. Complete the source download, then measure full-model calibration
+   memory, output fidelity and the native saver's floating-point passthrough path.
 2. Implement and numerically test sharded FP16 host PLE lookup with transfer and
    prefetch appropriate to Ascend. Check loading transients against host RAM,
    as well as steady-state table size. INT8 row storage is an optional later path.
@@ -98,9 +101,10 @@ fused 3D experts or quantized embedding tables as native supported inputs.
 5. Compare against the captured UD-IQ4_XS baseline: task success, first-token
    latency, decode throughput, long-context behavior and per-chip peak memory.
 
-Conversion, PLE formats, 310P inference and quality are **not yet implemented or
-validated for this model**. The outputs of the commands below are planning
-artifacts, not deployable checkpoints.
+Full-model conversion, quantized PLE formats, 310P inference and quality remain
+**unvalidated**. The outputs of the accounting commands below are planning
+artifacts, not deployable checkpoints. The new calibration command has a separate
+runbook and validation record.
 
 ## Reproduce the accounting
 
