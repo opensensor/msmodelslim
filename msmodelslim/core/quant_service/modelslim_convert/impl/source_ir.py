@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import fnmatch
 
-from msmodelslim.core.quant_service.modelslim_convert.virtual_module import ModelFreeModule
 from msmodelslim.core.convert.config import ConvertConfig, ModuleRule
-from msmodelslim.ir.kernels import WEIGHT_SCALE_INV_SUFFIX
 from msmodelslim.core.convert.types import IRKind, SourceIR, TensorRef
+from msmodelslim.core.quant_service.modelslim_convert.virtual_module import ModelFreeModule
+from msmodelslim.ir.kernels import WEIGHT_SCALE_INV_SUFFIX
 
 
 def infer_source_ir(module: ModelFreeModule, config: ConvertConfig) -> SourceIR:
@@ -29,6 +29,8 @@ def infer_source_ir(module: ModelFreeModule, config: ConvertConfig) -> SourceIR:
 
     bindings = module.tensor_bindings
     keys = set(bindings.keys())
+    if "weight" in keys and (bindings["weight"].dtype or "").lower() in ("i8", "int8", "torch.int8"):
+        return SourceIR(kind=IRKind.INT8_PER_CHANNEL, evidence=["int8 weight; schema checked before conversion"])
     if "weight_scale_inv" in keys or any(k.endswith("scale_inv") for k in keys):
         return SourceIR(kind=IRKind.FP8_BLOCK, evidence=["weight_scale_inv"])
     if "weight_packed" in keys:

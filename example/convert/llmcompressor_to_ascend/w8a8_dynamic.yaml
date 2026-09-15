@@ -1,0 +1,13 @@
+apiversion: modelslim_convert
+spec:
+  linears:
+    - match: ["*"]
+      target: W8A8_DYNAMIC
+      route: auto
+  save:
+    - type: ascend_v1
+      part_file_size: 1
+  parallel:
+    workers: 1
+    worker_device: cpu
+    max_group_size: 1

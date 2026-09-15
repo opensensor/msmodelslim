@@ -6,6 +6,7 @@ msmodelslim/lab_calib
 # ---- devcontainer / dev-only artifacts --------------------------------
 .devcontainer/.host-gitconfig
 .venv/
+.venv-cpu/
 
 # ---- python packaging & build artifacts -------------------------------
 build/

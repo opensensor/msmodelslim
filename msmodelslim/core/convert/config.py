@@ -162,3 +162,12 @@ class ConvertConfig(BaseModel):
                 f"FLOAT targets (e.g. fp8_block -> bf16)."
             )
         return self
+
+    @model_validator(mode="after")
+    def _dynamic_int8_requires_ascendv1(self) -> ConvertConfig:
+        if any(r.target_ir == IRKind.W8A8_DYNAMIC for r in self.convert_rules):
+            if self.dst_format.lower() not in _ASCENDV1_DST_FORMATS:
+                raise ValueError("target_ir W8A8_DYNAMIC requires dst_format ascendv1")
+            if self.preprocess_rules:
+                raise ValueError("W8A8_DYNAMIC import does not support preprocess rules; export unfused linears first")
+        return self

@@ -144,6 +144,16 @@ class IRResult:
         state_dict = _restore_state_dict(self.state_dict)
         if self.final_ir == IRKind.FLOAT:
             return _float_module_from_state_dict(state_dict)
+        if self.final_ir == IRKind.W8A8_DYNAMIC:
+            from msmodelslim.ir import W8A8DynamicPerChannelFakeQuantLinear, int8_per_channel_sym, int8_per_token_sym
+            from msmodelslim.ir.qal import QDType, QParam, QStorage
+
+            return W8A8DynamicPerChannelFakeQuantLinear(
+                x_q_param=QParam(scheme=int8_per_token_sym),
+                w_q_param=QParam(scheme=int8_per_channel_sym, ext={"scale": state_dict["weight_scale"]}),
+                w_q=QStorage(dtype=QDType.INT8, value=state_dict["weight"]),
+                bias=state_dict.get("bias"),
+            )
         if self.final_ir == IRKind.W8A8_MXFP8:
             if is_mxfp8_deploy_state(state_dict):
                 from msmodelslim.ir.w8a8_mx_dynamic import (
