@@ -89,7 +89,8 @@ not implement either.
 1. Bounded expert unpacking and text reference/calibration loading are implemented.
    Small CPU/CUDA GPTQ and native export tests pass, as does a real first-layer
    expert pilot. Complete the source download, then measure full-model calibration
-   memory, output fidelity and the native saver's floating-point passthrough path.
+   memory and output fidelity. The native FLOAT saver now streams its payload;
+   a real 6.4 GB PLE export passed with 1.03 GiB peak export RSS.
 2. Implement and numerically test sharded FP16 host PLE lookup with transfer and
    prefetch appropriate to Ascend. Check loading transients against host RAM,
    as well as steady-state table size. INT8 row storage is an optional later path.

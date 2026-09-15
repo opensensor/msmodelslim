@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
 """
@@ -42,7 +41,7 @@ class TestSaveProcessorAdapter:
         with (
             patch("msmodelslim.core.quant_service.modelslim_v1.save.ascendv1.AscendV1Saver") as mock_cls,
             patch(
-                "msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._lazy_init_unsaved_modules",
+                "msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._stream_unsaved_ascend_modules",
             ),
         ):
             mock_saver = MagicMock()
@@ -139,7 +138,7 @@ class TestSaveProcessorAdapter:
         with (
             patch("msmodelslim.core.quant_service.modelslim_v1.save.ascendv1.AscendV1Saver") as mock_saver_cls,
             patch(
-                "msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._lazy_init_unsaved_modules",
+                "msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._stream_unsaved_ascend_modules",
             ),
         ):
             mock_saver = MagicMock()
@@ -161,7 +160,7 @@ class TestSaveProcessorAdapter:
         with (
             patch("msmodelslim.core.quant_service.modelslim_v1.save.ascendv1.AscendV1Saver") as mock_cls,
             patch(
-                "msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._lazy_init_unsaved_modules",
+                "msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._stream_unsaved_ascend_modules",
             ) as mock_lazy,
         ):
             mock_saver = MagicMock()
@@ -185,7 +184,7 @@ class TestSaveProcessorAdapter:
         adapter = SaveProcessorAdapter()
         with (
             patch("msmodelslim.core.quant_service.modelslim_v1.save.ascendv1.AscendV1Saver") as mock_cls,
-            patch("msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._lazy_init_unsaved_modules"),
+            patch("msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._stream_unsaved_ascend_modules"),
         ):
             mock_saver = MagicMock()
             mock_saver.processed_modules = {module}
@@ -221,7 +220,7 @@ class TestSaveProcessorAdapter:
         with (
             patch("msmodelslim.core.quant_service.modelslim_v1.save.ascendv1.AscendV1Saver") as mock_cls,
             patch(
-                "msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._lazy_init_unsaved_modules",
+                "msmodelslim.core.quant_service.modelslim_convert.impl.save_adapter._stream_unsaved_ascend_modules",
             ),
             patch(
                 "msmodelslim.core.quant_service.modelslim_convert.impl.direct_save.merge_staged_output",

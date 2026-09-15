@@ -37,10 +37,11 @@ main model). A CPU weight budget is not a process RSS cap: activation caches,
 GPTQ Hessians, loader temporaries and file-backed pages require additional space.
 The exporter buffers approximately one output shard plus the current tensor;
 a single large floating-point tensor may exceed the configured shard target.
-Full-size memory and HDD throughput have not been measured. The existing native
-saver also initializes floating-point passthrough modules before finalization;
-its memory behavior with the full PLE payload needs attention before a full
-native export on the 128 GB conversion workstation.
+Full-size calibration memory and HDD throughput have not been measured. Native
+Ascend export now streams floating-point passthrough modules, releases their
+parameters and closes source shard mappings after each module. A real 6.4 GB
+PLE export peaked at 1.03 GiB RSS with exact value agreement. See the
+[full-run preparation record](QWEN38_PREPARATION.md).
 
 ## Run after the source download completes
 

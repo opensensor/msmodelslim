@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
 """
@@ -14,6 +13,7 @@ SaveProcessorAdapter（convert_design.md §11）。
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,8 +23,8 @@ from torch import nn
 from msmodelslim.core.base.protocol import BatchProcessRequest
 from msmodelslim.core.convert.protocol import ConvertContext
 from msmodelslim.format.registry import parse_format_config
-from msmodelslim.model.interface import IModel
 from msmodelslim.model.base import BaseModelAdapter
+from msmodelslim.model.interface import IModel
 from msmodelslim.processor.save.processor import (
     QuantSaveProcessor,
     QuantSaveProcessorConfig,
@@ -76,6 +76,57 @@ def _build_adapter(context: ConvertContext) -> IModel:
         model_type=model_type,
         model_path=Path(context.model_path),
     )
+
+
+def _stream_unsaved_ascend_modules(context: ConvertContext, tree: nn.Module, saver: Any) -> None:
+    """Load, write and release each FLOAT node, including large PLE shards.
+
+    A node can own parameters and children. Give the saver a shallow leaf view
+    so traversing its children cannot mark unloaded descendants as processed.
+    The shard writer may retain its bounded output buffer, but neither the tree
+    nor the saver's processed-module memo retains the complete FLOAT payload.
+    """
+    from msmodelslim.core.quant_service.modelslim_convert.impl.direct_save import release_processed_modules
+    from msmodelslim.core.quant_service.modelslim_convert.virtual_module import ModelFreeModule
+    from msmodelslim.infra.io.shard_handle_cache import ShardHandleCache
+
+    reader = context.reader
+    if reader is None:
+        return
+    had_cache = hasattr(reader, "shard_handle_cache")
+    previous_cache = getattr(reader, "shard_handle_cache", None)
+    cache = ShardHandleCache(max_shards=context.config.parallel.shard_cache_size)
+    reader.shard_handle_cache = cache
+    count = 0
+    try:
+        for name, module in tree.named_modules():
+            if not isinstance(module, ModelFreeModule):
+                continue
+            leaf = None
+            try:
+                module.lazy_init(reader, device="cpu")
+                leaf = copy(module)
+                leaf._modules = {}
+                saver.postprocess(BatchProcessRequest(name=name, module=leaf, datas=None, outputs=None))
+                count += 1
+            finally:
+                release_processed_modules(saver)
+                # Assign fresh dictionaries: the leaf still owns the old ones
+                # until it is released, as may the writer's current shard.
+                module._parameters = {}
+                module._buffers = {}
+                module.lazy_initialized = False
+                del leaf
+                # Open safetensors handles also retain file mappings. Closing
+                # them here prevents touched PLE pages accumulating across nodes.
+                cache.clear()
+    finally:
+        cache.clear()
+        if had_cache:
+            reader.shard_handle_cache = previous_cache
+        else:
+            del reader.shard_handle_cache
+    logger.info("Streamed and released %d FLOAT/passthrough module(s)", count)
 
 
 @dataclass
@@ -190,8 +241,11 @@ class SaveProcessorAdapter:
     def finalize(self) -> None:
         session = self._require_open_session()
         try:
-            logger.info("Streaming save finalize: lazy init passthrough / unconverted modules")
-            _lazy_init_unsaved_modules(session.context, session.tree)
+            logger.info("Streaming save finalize: save passthrough / unconverted modules")
+            if session.context.config.dst_format.lower() in _ASCEND_DST:
+                _stream_unsaved_ascend_modules(session.context, session.tree, session.bundle.saver)
+            else:
+                _lazy_init_unsaved_modules(session.context, session.tree)
             logger.info("Streaming save finalize: write metadata and close saver")
             session.bundle.saver.post_run()
             if session.direct_write:
@@ -235,8 +289,11 @@ class SaveProcessorAdapter:
 
     def save(self, context: ConvertContext, tree: nn.Module) -> None:
         bundle = _create_saver(context, tree)
-        _lazy_init_unsaved_modules(context, tree)
         bundle.saver.pre_run()
+        if context.config.dst_format.lower() in _ASCEND_DST:
+            _stream_unsaved_ascend_modules(context, tree, bundle.saver)
+        else:
+            _lazy_init_unsaved_modules(context, tree)
         if bundle.iterate_named_modules:
             for name, module in tree.named_modules():
                 if name:
