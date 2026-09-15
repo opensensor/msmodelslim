@@ -16,7 +16,9 @@ ConvertApplication：离线权重转换编排入口（convert_design.md §7）�
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 
 from torch import nn
 from tqdm import tqdm
@@ -146,6 +148,13 @@ class ConvertApplication:
         )
 
         self._run_convert_with_streaming_save(context, tree, routed)
+        if any(rule.target_ir == IRKind.W8A8_DYNAMIC for rule in config.convert_rules):
+            from msmodelslim.core.quant_service.modelslim_convert.impl.int8_verify import verify
+
+            report = verify(config.model_path, config.save_path)
+            (Path(config.save_path) / "conversion_report.json").write_text(
+                json.dumps(report, indent=2) + "\n", encoding="utf-8"
+            )
         logger.info("Convert finished in %.2fs", time.perf_counter() - pipeline_t0)
 
     def _run_convert_with_streaming_save(self, context: ConvertContext, tree, routed: list[RoutedTask]) -> None:

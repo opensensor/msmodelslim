@@ -10,11 +10,23 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from msmodelslim.core.quant_service.modelslim_convert.impl.int8_verify import verify
+
 pytest.importorskip("llmcompressor")
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig, Qwen3MoeForCausalLM
+from transformers import (
+    Glm4MoeConfig,
+    Glm4MoeForCausalLM,
+    PreTrainedTokenizerFast,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+    Qwen3MoeConfig,
+    Qwen3MoeForCausalLM,
+    Qwen3NextConfig,
+    Qwen3NextForCausalLM,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "example/convert/llmcompressor_to_ascend"
@@ -37,6 +49,32 @@ def create_source(path, architecture="dense", num_layers=1):
     if architecture == "moe":
         model = Qwen3MoeForCausalLM(
             Qwen3MoeConfig(**kwargs, moe_intermediate_size=48, num_experts=4, num_experts_per_tok=2)
+        )
+    elif architecture == "glm":
+        model = Glm4MoeForCausalLM(
+            Glm4MoeConfig(
+                **{**kwargs, "num_hidden_layers": 2},
+                moe_intermediate_size=48,
+                n_routed_experts=4,
+                num_experts_per_tok=2,
+                n_shared_experts=1,
+                first_k_dense_replace=1,
+            )
+        )
+    elif architecture == "next":
+        model = Qwen3NextForCausalLM(
+            Qwen3NextConfig(
+                **{**kwargs, "num_hidden_layers": 2},
+                moe_intermediate_size=48,
+                num_experts=4,
+                num_experts_per_tok=2,
+                shared_expert_intermediate_size=48,
+                layer_types=["linear_attention", "full_attention"],
+                linear_key_head_dim=8,
+                linear_value_head_dim=8,
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+            )
         )
     else:
         model = Qwen3ForCausalLM(Qwen3Config(**kwargs))
@@ -64,7 +102,8 @@ def read_tensors(path):
     return tensors
 
 
-@pytest.mark.parametrize("architecture,method", [("dense", "rtn"), ("dense", "gptq"), ("moe", "rtn"), ("moe", "gptq")])
+@pytest.mark.parametrize("architecture", ["dense", "moe", "glm", "next"])
+@pytest.mark.parametrize("method", ["rtn", "gptq"])
 def test_local_calibration_then_ascend_export(tmp_path, architecture, method):
     source, compressed, ascend = tmp_path / "source", tmp_path / "compressed", tmp_path / "ascend"
     create_source(source, architecture)
@@ -99,11 +138,19 @@ def test_local_calibration_then_ascend_export(tmp_path, architecture, method):
     assert manifest["device"] == "cpu"
     before = read_tensors(compressed)
     int8_keys = {key for key, tensor in before.items() if key.endswith(".weight") and tensor.dtype == torch.int8}
-    assert len(int8_keys) == (16 if architecture == "moe" else 7)
+    assert len(int8_keys) == {"dense": 7, "moe": 16, "glm": 26, "next": 37}[architecture]
     if architecture == "moe":
         assert len([k for k in int8_keys if ".experts." in k]) == 12
         assert not any("gate_up_proj" in k for k in before)
         assert before["model.layers.0.mlp.gate.weight"].dtype == torch.bfloat16
+    if architecture == "glm":
+        assert len([k for k in int8_keys if ".experts." in k]) == 12
+        assert before["model.layers.1.mlp.gate.e_score_correction_bias"].dtype == torch.float32
+    if architecture == "next":
+        assert len([k for k in int8_keys if ".experts." in k]) == 24
+        assert before["model.layers.0.linear_attn.conv1d.weight"].dtype == torch.bfloat16
+        assert "model.layers.0.linear_attn.A_log" in before
+        assert "model.layers.0.linear_attn.dt_bias" in before
     result = run(
         [
             str(Path(sys.executable).parent / "msmodelslim"),
@@ -131,6 +178,9 @@ def test_local_calibration_then_ascend_export(tmp_path, architecture, method):
     assert (ascend / "calibration_manifest.json").read_bytes() == (
         compressed / "calibration_manifest.json"
     ).read_bytes()
+    report = verify(compressed, ascend, check_values=True, chunk_rows=7)
+    assert report["quantized_linears"] == len(int8_keys)
+    assert report["validation"] == "values"
 
 
 @pytest.mark.parametrize("method", ["rtn", "gptq"])

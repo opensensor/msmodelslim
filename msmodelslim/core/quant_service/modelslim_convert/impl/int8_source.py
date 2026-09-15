@@ -14,8 +14,7 @@ from msmodelslim.core.convert.types import IRKind
 
 def validate_int8_source(reader, catalog, config) -> None:
     validate_int8_destination(config)
-    model_config = reader.read_model_config()
-    _validate_int8_source(reader, catalog, config, model_config)
+    validate_int8_checkpoint(reader, catalog, config)
 
 
 def validate_int8_destination(config) -> None:
@@ -30,7 +29,9 @@ def validate_int8_destination(config) -> None:
         raise ValueError("INT8 import requires an empty destination directory")
 
 
-def _validate_int8_source(reader, catalog, config, model_config) -> None:
+def validate_int8_checkpoint(reader, catalog, config) -> None:
+    """Validate the source contract independently of output-directory policy."""
+    model_config = reader.read_model_config()
     quant = model_config.get("quantization_config") or {}
     if not quant:
         quant = (model_config.get("text_config") or {}).get("quantization_config") or {}
@@ -77,6 +78,11 @@ def _validate_int8_source(reader, catalog, config, model_config) -> None:
             scale = catalog.get(path + ".weight_scale")
             if scale is None or scale.shape not in ((entry.shape[0],), (entry.shape[0], 1)):
                 raise ValueError(f"{path}: missing or invalid per-output-channel weight_scale")
+            if scale.dtype not in ("F16", "BF16", "F32"):
+                raise ValueError(f"{path}: expected floating-point per-output-channel scales (FP16/BF16/FP32)")
+            bias = catalog.get(path + ".bias")
+            if bias is not None and (bias.shape != (entry.shape[0],) or bias.dtype not in ("F16", "BF16", "F32")):
+                raise ValueError(f"{path}: invalid linear bias")
             quantized_paths.add(path)
         elif key.endswith(".weight") and entry.dtype not in ("BF16", "F16", "F32", "F64"):
             raise ValueError(f"Unsupported source weight dtype {entry.dtype}: {key}")

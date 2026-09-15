@@ -41,6 +41,8 @@ def make_source(path, *, sharded=False):
         "model.norm.weight": torch.ones(3, dtype=torch.float16),
         "model.embed_tokens.weight": torch.arange(12, dtype=torch.float16).reshape(4, 3),
         "lm_head.weight": torch.ones(4, 3, dtype=torch.float16),
+        "model.layers.0.mlp.gate.weight": torch.ones(4, 3, dtype=torch.float32),
+        "model.layers.0.mlp.gate.e_score_correction_bias": torch.tensor([0.1, -0.2, 0.3, -0.4]),
     }
     if sharded:
         # Put a scale in another shard to exercise dependency-based loading.

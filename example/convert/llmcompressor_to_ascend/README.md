@@ -120,9 +120,22 @@ The command keeps the language-model head and conventional MoE router/gate names
 in floating point; `--ignore` adds exclusions. These defaults require review for
 each new architecture. `--sequential-target` can select a decoder-layer class
 when automatic tracing needs guidance. LLM-Compressor performs supported expert
-linearization during loading. Tiny Qwen3 and Qwen3-MoE tests cover both RTN and
-sequential GPTQ, and an independent check compares logits before and after MoE
-linearization. Other architectures still need their own validation.
+linearization during loading. Tiny Qwen3, Qwen3-MoE, GLM-4-MoE and Qwen3-Next tests
+cover both RTN and sequential GPTQ. An independent check compares logits before
+and after Qwen3-MoE linearization. These are CPU format/calibration checks, not
+validation of full-size model quality or 310P execution.
+
+| Tested family | CPU fixture coverage |
+| --- | --- |
+| Qwen3 | Dense attention and MLP linears |
+| Qwen3-MoE | Unfused expert projections and floating-point router |
+| GLM-4-MoE (GLM-4.5 family) | Dense first layer, routed/shared experts, FP32 router correction tensor |
+| Qwen3-Next | Both linear/full attention, routed/shared experts, convolution and recurrent parameters |
+
+The GLM fixture uncovered a dropped router correction tensor when a floating-point
+virtual linear stored auxiliary tensors as buffers. The converter now preserves
+those tensors through the native saver's parameter enumeration. Regression tests
+also use nonzero corrections so preservation is checked beyond initialized zeros.
 
 `--cpu-memory-gib` budgets **weight placement**, not total process RAM. Calibration
 activations, Hessian matrices, loading transients and the active layer/expert
@@ -135,6 +148,33 @@ successful save writes `calibration_manifest.json` with package versions, settin
 sample count, a tokenized-data fingerprint and the modules initially offloaded to
 disk. Keep intermediate weights and scratch files until validation is complete.
 The manifest records calibration completion, not Ascend inference compatibility.
+
+## Verify exported checkpoints
+
+Every W8A8 import now validates its completed checkpoint inventory, shard index,
+tensor shapes/dtypes, per-tensor quantization tags and model configuration before
+reporting success. `conversion_report.json` records this **header-only** check,
+tensor counts, and source/export tensor payload sizes in bytes. These are serialized
+tensor sizes, not runtime RAM/VRAM requirements or filesystem allocation sizes.
+
+For a separate comparison of every tensor value:
+
+```bash
+CUDA_VISIBLE_DEVICES='' .venv-cpu/bin/python \
+  example/convert/llmcompressor_to_ascend/verify_w8a8.py \
+  --source /path/to/compressed-w8a8 \
+  --export /path/to/ascend-output \
+  --check-values --chunk-rows 1024
+```
+
+The command prints a JSON report and returns a nonzero status for mismatches.
+Without `--check-values`, it reads headers only. Value checks compare integer
+weights and floating-point exclusions exactly, account for widening of scales and
+quantized-linear biases to FP32, and verify zero offsets/zero points and positive
+finite scales. Reads are chunked along the first tensor dimension; reduce
+`--chunk-rows` to reduce comparison memory. A complete value check reads both
+checkpoints in full and can be slow on HDDs. Neither mode certifies Ascend kernel
+accuracy, model architecture support, or language-model quality.
 
 ## Export and test
 

@@ -16,9 +16,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from msmodelslim.core.quant_service.modelslim_convert.weight_mapping.fused_load import load_logical_tensor
 from msmodelslim.core.convert.protocol import ICheckpointReader
 from msmodelslim.core.convert.types import IRKind, SourceIR, TensorRef
+from msmodelslim.core.quant_service.modelslim_convert.weight_mapping.fused_load import load_logical_tensor
 
 
 class ModelFreeModule(nn.Module):  # pylint: disable=abstract-method
@@ -84,7 +84,10 @@ class ModelFreeModule(nn.Module):  # pylint: disable=abstract-method
         self.lazy_initialized = True
 
     def _register_logical(self, logical: str, tensor: torch.Tensor) -> None:
-        if logical in ("weight", "bias"):
+        # FLOAT modules are passed to AscendV1Saver without an IR transform.
+        # Its FLOAT handler enumerates parameters, so auxiliary checkpoint
+        # tensors (e.g. GLM router correction bias) must also be parameters.
+        if logical in ("weight", "bias") or self.source_ir.kind == IRKind.FLOAT:
             self.register_parameter(logical, nn.Parameter(tensor, requires_grad=False))
         else:
             self.register_buffer(logical, tensor, persistent=True)
