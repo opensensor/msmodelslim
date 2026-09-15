@@ -19,6 +19,11 @@ The [full-size Qwen3-8B RTX pilot](QWEN3_8B_PILOT.md) completed GPTQ calibration
 native export, exact verification and a held-out reference quality comparison.
 It produced 9.45 GB of native tensor payload; actual Duo inference remains pending.
 
+The next target is [Qwen3.8-Flash-Next against the user's UD-IQ4_XS baseline](QWEN38_FLASH_NEXT_PLAN.md).
+Its complete header audit supports planning INT8 routed experts with separately
+placed n-gram tables. This architecture and embedding path still require
+implementation; the existing calibration command cannot yet convert this model.
+
 ## Supported checkpoint contract
 
 | Source | Ascend output |
