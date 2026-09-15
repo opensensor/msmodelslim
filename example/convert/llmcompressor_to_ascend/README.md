@@ -62,9 +62,10 @@ check out the revisions above. Existing clones need not be replaced.
 git clone --branch 0.12.0.1 https://github.com/vllm-project/llm-compressor.git ../llm-compressor
 git clone --branch 0.17.1 https://github.com/vllm-project/compressed-tensors.git ../compressed-tensors
 uv venv --python 3.12 .venv-cpu
-uv pip install --python .venv-cpu/bin/python torch==2.11.0 --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python .venv-cpu/bin/python torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu
 uv pip install --python .venv-cpu/bin/python -r example/convert/llmcompressor_to_ascend/requirements-cpu.txt
 uv pip install --python .venv-cpu/bin/python --no-deps -e . -e ../llm-compressor -e ../compressed-tensors
+git -C ../compressed-tensors apply ../msmodelslim/example/convert/llmcompressor_to_ascend/patches/compressed-tensors-disk-dtype.patch
 ln -s ../config msmodelslim/config
 ln -s ../lab_calib msmodelslim/lab_calib
 ln -s ../lab_practice msmodelslim/lab_practice
@@ -75,10 +76,65 @@ installs need these links because the upstream legacy setup hook does not create
 them under PEP 660. Editable dependency versions may have `.dev0` suffixes even
 at release tags; the Git revisions above identify the tested code.
 
-This environment intentionally has CPU-only PyTorch and a small dependency set
-for RTN/GPTQ tests; optional AutoRound/media features are not installed. Use a
-separate CUDA environment for eventual RTX calibration. Python 3.12 avoids a
+The bundled compressed-tensors patch restores parameter metadata **after** a disk
+cache dtype cast. Without it, loading FP32 source shards as BF16 can lose the
+`Parameter` type and fail when saving a disk-offloaded model. The local dependency
+checkout includes this patch; skip `git apply` if already applied. A regression
+test checks parameter type and metadata, and forced-disk runs are compared with CPU-resident
+quantization. The patch applies to the exact revision listed above.
+
+This environment intentionally has CPU-only PyTorch and torchvision. Transformers
+5.9's MoE patch discovery imports image-processing aliases even for text models,
+so torchvision is needed for this loading path. Optional AutoRound features are
+not installed. Use a separate CUDA environment for eventual RTX calibration. Python 3.12 avoids a
 Python 3.14/Pydantic annotation failure encountered when importing LLM-Compressor.
+
+## Calibrate local floating-point weights
+
+`quantize_w8a8.py` prepares the compressed-tensors input for the exporter. It loads
+local safetensors and tokenizer files without remote code, uses CPU/disk weight
+placement with a configurable budget, and invokes sequential GPTQ calibration.
+The default device is CPU; CUDA requires an explicit `--device cuda` and a
+separate environment with CUDA-enabled PyTorch. CPU mode hides CUDA devices
+before importing accelerator-aware libraries.
+
+```bash
+CUDA_VISIBLE_DEVICES='' .venv-cpu/bin/python \
+  example/convert/llmcompressor_to_ascend/quantize_w8a8.py \
+  --model-path /path/to/original-floating-point-model \
+  --save-path /path/to/fresh-compressed-w8a8 \
+  --offload-dir /path/to/fresh-nvme-scratch \
+  --method gptq --device cpu --dtype bfloat16 \
+  --cpu-memory-gib 64 \
+  --calibration-data /path/to/representative.jsonl \
+  --samples 512 --sequence-length 2048
+```
+
+The first `--samples` nonblank JSONL records must contain either `{"text": "..."}`
+or `{"messages": [{"role": "user", "content": "..."}]}`. Chat records use the
+tokenizer's chat template without adding special tokens twice. Samples are
+truncated to the requested sequence length; fewer records or empty tokenized
+samples are rejected. RTN uses `--method rtn` and no calibration file.
+
+The command keeps the language-model head and conventional MoE router/gate names
+in floating point; `--ignore` adds exclusions. These defaults require review for
+each new architecture. `--sequential-target` can select a decoder-layer class
+when automatic tracing needs guidance. LLM-Compressor performs supported expert
+linearization during loading. Tiny Qwen3 and Qwen3-MoE tests cover both RTN and
+sequential GPTQ, and an independent check compares logits before and after MoE
+linearization. Other architectures still need their own validation.
+
+`--cpu-memory-gib` budgets **weight placement**, not total process RAM. Calibration
+activations, Hessian matrices, loading transients and the active layer/expert
+need additional space. For models requiring post-load expert splitting, temporary
+fused tensors may also be large. Disk offload is exercised on tiny models; this
+does not establish a full-size model's RAM/VRAM ceiling or acceptable HDD speed.
+
+Output and offload directories must be fresh and separate from the source. A
+successful save writes `calibration_manifest.json` with package versions, settings,
+sample count, a tokenized-data fingerprint and the modules initially offloaded to
+disk. Keep intermediate weights and scratch files until validation is complete.
+The manifest records calibration completion, not Ascend inference compatibility.
 
 ## Export and test
 
@@ -101,6 +157,12 @@ The LLM-Compressor tests construct a tiny random Qwen3 locally and perform both
 RTN and GPTQ quantization before invoking the real CLI. They require no model
 download, credentials or accelerator. Synthetic calibration verifies plumbing,
 not useful language-model quality.
+
+The calibration workflow tests also cover Qwen3-MoE, sequential GPTQ, forced disk
+offload, unchanged source files and exact agreement with CPU-resident quantization.
+The bundled disk-cache regression runs on CPU. The upstream compressed-tensors
+offload suite currently assumes an accelerator during fixture collection and
+cannot be collected in this CPU-only environment.
 
 The example uses one CPU worker, one linear per conversion group, and 1 GB output
 shards. This limits concurrent conversion payloads but is not a hard RAM ceiling:
