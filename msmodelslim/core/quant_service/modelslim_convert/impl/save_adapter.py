@@ -289,11 +289,12 @@ class SaveProcessorAdapter:
 
     def save(self, context: ConvertContext, tree: nn.Module) -> None:
         bundle = _create_saver(context, tree)
-        bundle.saver.pre_run()
         if context.config.dst_format.lower() in _ASCEND_DST:
+            bundle.saver.pre_run()
             _stream_unsaved_ascend_modules(context, tree, bundle.saver)
         else:
             _lazy_init_unsaved_modules(context, tree)
+            bundle.saver.pre_run()
         if bundle.iterate_named_modules:
             for name, module in tree.named_modules():
                 if name:
