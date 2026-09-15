@@ -445,3 +445,73 @@ def test_quality_cli_validates_before_loading(source, tmp_path):
     args = parse_args([*arguments, "--quality-report-dir", str(tmp_path / "quality")])
     assert args.quality_records == [{"text": "held out text"}]
     assert not args.offload_dir.exists()
+
+
+def test_moe_probe_disk_parity_and_gptq_observation(source, tmp_path):
+    from accelerate import init_empty_weights
+    from datasets import Dataset
+    from llmcompressor import oneshot
+    from probe_qwen38_moe import CapturedMoe, MeasuredGPTQ, load_part
+    from qwen38.model import LinearExperts, build_config
+    from qwen38.reference import Qwen4ExpTextSparseMoeBlock
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    directory, original, _ = source
+    checkpoint = Checkpoint(directory)
+    config = build_config(checkpoint.text_config)
+    with init_empty_weights():
+        moe = Qwen4ExpTextSparseMoeBlock(config)
+        moe.experts = LinearExperts(config)
+    offload = tmp_path / "offload"
+    offload.mkdir()
+    moe = load_part(checkpoint, moe, "model.language_model.layers.0.mlp", device="cpu", offload_dir=offload)
+    features = torch.randn(12, config.hidden_size, dtype=torch.float16)
+    model = CapturedMoe(features, moe).eval()
+    with torch.no_grad():
+        expected = original.model.language_model.layers[0].mlp.half()(features[None])
+        torch.testing.assert_close(model(torch.arange(12)[None]), expected, atol=1e-3, rtol=1e-3)
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+    )
+    recipe = MeasuredGPTQ(scheme="W8A8", targets=[r"re:.*experts\.\d+\.(gate_proj|up_proj|down_proj)"])
+    oneshot(
+        model=model,
+        tokenizer=tokenizer,
+        recipe=recipe,
+        dataset=Dataset.from_dict({"input_ids": [list(range(8))], "attention_mask": [[1] * 8]}),
+        num_calibration_samples=1,
+        max_seq_length=8,
+        pipeline="sequential",
+        sequential_targets=["Qwen4ExpTextSparseMoeBlock"],
+        sequential_offload_device="cpu",
+        moe_calibrate_all_experts=True,
+        output_dir=None,
+        clear_sparse_session=True,
+    )
+    assert recipe._observations == [{"matrices": 9, "hessian_bytes": 3 * (2 * 16**2 + 8**2) * 4, "minimum_samples": 1}]
+    with torch.no_grad():
+        assert torch.isfinite(model(torch.arange(8, 12)[None])).all()
+
+
+def test_moe_probe_rejects_first_layer_ple(source):
+    from probe_qwen38_moe import capture_inputs
+    from qwen38.model import build_config
+
+    directory, _, _ = source
+    checkpoint = Checkpoint(directory)
+    with pytest.raises(ValueError, match="first-layer GDN without PLE"):
+        capture_inputs(checkpoint, build_config(checkpoint.text_config), [], "cpu")
+
+
+def test_moe_probe_rejects_cpu_with_visible_accelerator(monkeypatch):
+    from types import SimpleNamespace
+
+    from probe_qwen38_moe import probe
+
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    with pytest.raises(ValueError, match="accelerator isolation"):
+        probe(SimpleNamespace(device="cpu"))

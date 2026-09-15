@@ -116,3 +116,81 @@ execution. It does not validate exported Ascend execution, long-context behavior
 vision, MTP, generation quality or parity with the current IQ4_XS GGUF baseline.
 Tiny-model CPU/CUDA tests exercise the measurement and conversion path; full-model
 quality results remain pending the download and conversion run.
+
+## Full MoE component probe
+
+`probe_qwen38_moe.py` exercises all 512 routed experts in the first MoE layer,
+using real token embeddings, GDN attention and gated residuals to obtain its
+inputs. It also loads the real router and shared expert. It needs only the
+checkpoint shards containing those components, so it can run before the entire
+download finishes. The command rejects a first layer with PLE or non-GDN attention.
+For CPU-only diagnostics, hide accelerators before launching Python (for CUDA,
+set `CUDA_VISIBLE_DEVICES=''`); LLM-Compressor otherwise selects an accelerator
+for its sequential pipeline even if input weights initially reside on CPU.
+
+```bash
+.venv-cuda/bin/python example/convert/llmcompressor_to_ascend/probe_qwen38_moe.py \
+  --model-path /path/to/original/Qwen3.8-Flash-Next \
+  --offload-dir /path/on/nvme/fresh-probe-offload \
+  --report /path/to/run/result.json \
+  --calibration-data /path/to/train_sft.jsonl \
+  --quality-data /path/to/test_sft.jsonl \
+  --samples 8 --quality-samples 2 --sequence-length 1024 --device cuda
+```
+
+Every MoE weight is placed on disk and loaded to the execution device on demand.
+Sequential GPTQ uses the same W8A8 recipe and all-experts calibration behavior as
+the full converter, targeting this single MoE block. The probe records the actual
+number and storage size of live Hessian matrices immediately before compression,
+GPU allocation/reservation peaks, process RSS and calibration time. A small
+subclass observes the pinned LLM-Compressor internals without changing GPTQ math.
+
+For 512 experts with hidden size 2,560 and intermediate size 640, the theoretical
+FP32 Hessian payload is `512 * (2 * 2560**2 + 640**2) * 4` = 27,682,406,400 bytes.
+This excludes weights, activations, inverse-matrix temporaries and allocator
+overhead. Matrix size alone does not establish the full converter's memory fit.
+
+Two held-out conversations compare the complete MoE output before and after
+quantization, including routing and the shared expert. The error is a local
+activation RMSE, not perplexity or a predicted percentage of model quality loss.
+The probe does not exercise later-layer PLE/QSA, export a checkpoint or run Ascend
+kernels. Captured activations use a small calibration dataset and the probe
+does not retain the full model's 64 GiB CPU weight placement.
+
+### Measured result on 2026-09-15
+
+The real layer completed on the RTX PRO 6000 Blackwell with forced NVMe offload:
+
+| Observation | Result |
+| --- | ---: |
+| Routed experts / quantized projections | 512 / 1,536 |
+| Calibration conversations / tokens | 8 / 7,336 |
+| Held-out conversations / tokens | 2 / 2,048 |
+| Observed live FP32 Hessian payload | 27,682,406,400 bytes |
+| Minimum calibration samples per projection | 8 |
+| Peak PyTorch CUDA allocation | 34,336,519,680 bytes (31.98 GiB) |
+| Peak PyTorch CUDA reservation | 34,378,612,736 bytes (32.02 GiB) |
+| Peak process RSS | 2,848,908 KiB (2.72 GiB) |
+| Sequential calibration/compression time | 465.6 seconds |
+| Whole probe time, excluding Python startup | 500.1 seconds |
+| Held-out MoE output RMSE | 0.00117161 |
+| Held-out floating-point MoE output RMS | 0.04526633 |
+
+The matrix payload exactly matches the architectural calculation. This removes
+the uncertainty about whether all experts' GPTQ matrices fit together on this
+GPU. It does not measure full-model peak memory with 128 calibration conversations,
+all decoder components, PLE lookup and the remaining weights resident in CPU RAM.
+The existing 64 GiB free-GPU preflight requirement remains unchanged.
+
+At this small sample count, repeating the measured calibration stage 48 times
+would already take about 6.2 hours. That is an illustrative component extrapolation,
+not a full-run ETA; full calibration uses more samples and adds attention, PLE,
+held-out evaluation, loading and two checkpoint writes.
+
+Commands, logs, results, package versions, implementation hashes and verified
+source-shard records are retained under
+`models/conversion-runs/qwen3.8-flash-next-full-moe-probe` on the 4 TB drive.
+`probe-executed.py` preserves the exact executed script. The committed script
+additionally rejects CPU mode when an accelerator remains visible; the CUDA
+calculation is unchanged. Regression coverage includes fused/linear MoE parity,
+forced disk offload, real GPTQ matrix observations and unsupported-mode rejection.
