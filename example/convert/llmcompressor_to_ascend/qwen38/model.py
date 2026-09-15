@@ -13,6 +13,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .checkpoint import Checkpoint, MappedEmbedding
 from .configuration import Qwen4ExpTextConfig
+from .ple_cache import CachedEmbedding
 from .reference import (
     Qwen4ExpTextDecoderLayer,
     Qwen4ExpTextExperts,
@@ -128,7 +129,7 @@ def build_config(source):
     return Qwen4ExpTextConfig(**values)
 
 
-def load_model(path, offload_dir, dtype=torch.float16, device="cpu", cpu_budget_bytes=64 * 1024**3):
+def load_model(path, offload_dir, dtype=torch.float16, device="cpu", cpu_budget_bytes=64 * 1024**3, ple_cache=None):
     """Build on meta; place each projection separately under a CPU weight budget."""
     if dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("only floating calibration dtypes are supported")
@@ -155,9 +156,14 @@ def load_model(path, offload_dir, dtype=torch.float16, device="cpu", cpu_budget_
                 model.set_submodule(name, LinearExperts(config))
     for name, module in list(model.named_modules()):
         if isinstance(module, nn.Embedding) and name.endswith("ple.ple_embedding.ngram_embedding"):
+            embedding = (
+                CachedEmbedding(checkpoint, name, module.num_embeddings, module.embedding_dim, dtype, ple_cache[name])
+                if ple_cache is not None
+                else MappedEmbedding(checkpoint, name, module.num_embeddings, module.embedding_dim, dtype)
+            )
             model.set_submodule(
                 name,
-                MappedEmbedding(checkpoint, name, module.num_embeddings, module.embedding_dim, dtype),
+                embedding,
             )
     placed = 0
     loaded = set()

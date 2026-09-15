@@ -135,6 +135,37 @@ def compare_reports(before, after):
     }
 
 
+def validate_baseline(report, model, rows, device, chunk_size):
+    """Validate an explicitly supplied legacy baseline, before attaching GPTQ.
+
+    Legacy reports do not hash the source weights: callers must retain the
+    original source. New automatic reuse is additionally bound to StageStore's
+    source/code/token fingerprint.
+    """
+    expected = {
+        "model_path": str(model.config._name_or_path),
+        "token_ids_sha256": hashlib.sha256(json.dumps([row["input_ids"] for row in rows]).encode()).hexdigest(),
+        "predicted_tokens": sum(len(row["input_ids"]) - 1 for row in rows),
+        "device": str(device),
+        "dtype": str(model.dtype),
+        "logit_chunk_size": chunk_size,
+        "quantized_projections": 0,
+        "execution": "floating-point reference",
+        "metric": "all-token next-token perplexity, including user and assistant text",
+    }
+    for key, value in expected.items():
+        if report.get(key) != value:
+            raise ValueError(f"baseline mismatch: {key}")
+    if len(report["samples"]) != len(rows):
+        raise ValueError("baseline sample count mismatch")
+    for sample, row in zip(report["samples"], rows, strict=True):
+        if sample["predicted_tokens"] != len(row["input_ids"]) - 1 or not math.isfinite(sample["nll"]):
+            raise ValueError("invalid baseline sample")
+    mean = sum(sample["nll"] for sample in report["samples"]) / expected["predicted_tokens"]
+    if not math.isclose(mean, report["mean_nll"]) or not math.isclose(math.exp(mean), report["perplexity"]):
+        raise ValueError("baseline aggregate mismatch")
+
+
 def write_report(path, report):
     payload = json.dumps(report, indent=2, allow_nan=False) + "\n"
     with path.open("x", encoding="utf-8") as handle:

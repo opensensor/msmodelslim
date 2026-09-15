@@ -14,9 +14,11 @@ license are included. It does not provide Ascend serving support.
   assigned to CPU or disk under an explicit CPU weight-placement budget, with
   execution on the requested CPU/CUDA device. Buffers and unconsumed source
   tensors are checked, and an incomplete download fails before loading starts.
-- PLE tables remain in source safetensors files. Lookup gathers selected rows
-  across checkpoint shard boundaries and transfers those rows to the execution
-  device. It does not stage the 102.4 GB table into RAM or GPU memory.
+- With `--ple-cache-dir`, PLE hashing prepares exactly the rows needed by the
+  calibration and evaluation inputs. A bounded sequential scan of the original
+  102.4 GB table creates a compact, persistent cache. Forward passes gather from
+  that cache in RAM; unexpected rows fail instead of falling back to HDD reads.
+  Without the option, lookup uses source safetensors mappings.
 - The text reference includes GDN, QSA and its indexer, four-stream gated
   residuals, PLE hashing/convolution, routing and shared experts. Calibration is
   eager and uncached. The wrapper deliberately rejects generation/cache and
@@ -37,7 +39,10 @@ main model). A CPU weight budget is not a process RSS cap: activation caches,
 GPTQ Hessians, loader temporaries and file-backed pages require additional space.
 The exporter buffers approximately one output shard plus the current tensor;
 a single large floating-point tensor may exceed the configured shard target.
-Full-size calibration memory and HDD throughput have not been measured. Native
+The initial full run's 64 GiB CPU weight budget caused heavy swapping, and random
+PLE lookups on HDD took roughly 390 seconds per calibration sample. Use a 16 GiB
+weight budget on the 128 GB conversion workstation, NVMe weight offload and the
+prepared PLE row cache. Monitor total RAM and swap separately. Native
 Ascend export now streams floating-point passthrough modules, releases their
 parameters and closes source shard mappings after each module. A real 6.4 GB
 PLE export peaked at 1.03 GiB RSS with exact value agreement. See the
@@ -54,7 +59,9 @@ Use fresh output and offload directories. Prefer NVMe for offload when available
   --save-path /path/to/fresh/compressed-qwen38 \
   --offload-dir /path/to/fresh/offload-qwen38 \
   --device cuda --dtype float16 --target atlas-300i-duo \
-  --cpu-memory-gib 64 --method gptq \
+  --cpu-memory-gib 16 --method gptq \
+  --checkpoint-dir /path/to/durable/qwen38-stages \
+  --ple-cache-dir /path/to/nvme/qwen38-ple-rows \
   --calibration-data /path/to/train_sft.jsonl --samples 128 --sequence-length 1024
 ```
 
@@ -64,6 +71,52 @@ the current IQ4_XS GGUF or an FP8 checkpoint for the floating-point source.
 `calibration_manifest.json` records method, input-token hash, package versions,
 device, memory observations and exported tensor counts. The compressed checkpoint
 is an intermediate for the ModelSlim bridge, not a claim of serving compatibility.
+
+## Durable resume
+
+`--checkpoint-dir` enables the adapter's resumable sequential GPTQ pipeline.
+After each stage finishes quantization and propagation, it writes exact floating
+GPTQ weights, scales, zero points, propagated activations and random generator
+state. Files are checksummed and synced before the progress manifest is replaced
+atomically. Incomplete writes are ignored. Only the latest activation cache is
+retained; all completed expert weights remain available.
+
+After interruption, repeat the command with `--resume`, the same checkpoint and
+PLE cache directories, and **fresh output, offload and quality-report directories**.
+The completed stages are restored and skipped. Old offload files are temporary
+scratch and may be removed only after their process exits; they are not resume
+checkpoints. Do not remove the durable stage directory until the final exports
+and verification have succeeded.
+
+Resume checks source metadata and current shard sizes/mtimes, tokenized datasets,
+seed, dtype/device, adapter and LLMC/CT Python code, dependency versions and the
+traced graph. Changed settings or damaged checkpoint files fail closed. Source
+provenance records verified payload hashes; resume does not rehash all 360 GB.
+Keep the source immutable. A lock prevents concurrent writers to a stage store.
+
+The current incomplete stage must be repeated; in-flight Hessians are not saved.
+The initial run predates these checkpoints and its completed first decoder could
+not be recovered. Its already completed floating quality baseline was preserved.
+New baselines and completed quantized quality reports are retained in the stage
+store, so resuming after calibration/export failure avoids repeating them.
+`--reuse-baseline /path/to/before.json` explicitly imports an older baseline after
+validating source path, exact token hash, token counts, dtype, device, logit chunk
+size and aggregate metrics. Legacy reports have no weight hash: use this only
+with their unchanged original source and reference implementation.
+
+The exact floating resume weights add approximately 242 GB for this model, plus
+the latest activation cache and temporary space while writing the next boundary.
+Budget around 750 GB free on the output drive for resume weights and both final
+exports, in addition to source weights; keep about 250 GB available for NVMe
+weight offload with the 16 GiB CPU budget. PLE row caching is a calibration I/O
+optimization and does not reduce the full PLE tables in the exported checkpoint.
+
+CPU and FP16 CUDA tests interrupt after a completed decoder, during a checkpoint
+write, and after the final stage. Each resumed run produces exactly the same
+weights and quantization parameters as the pinned uninterrupted pipeline. Tests
+also reject mismatched fingerprints and damaged files and verify cached PLE
+forward parity, including EOS and padding behavior. Ascend execution remains a
+separate validation gate.
 
 ## Validation on 2026-09-14
 

@@ -154,6 +154,38 @@ def test_ple_row_boundaries_and_repetition(source):
         mapped(torch.tensor([table.shape[0]]))
 
 
+def test_exact_prepared_ple_cache(source, tmp_path):
+    from qwen38.model import build_config
+    from qwen38.ple_cache import CachedEmbedding, prepare_ple_cache
+
+    directory, original, _ = source
+    rows = [{"input_ids": [3, 4, 2, 5, 6, 7, 8, 9], "attention_mask": [1] * 8}]
+    checkpoint = Checkpoint(directory)
+    caches = prepare_ple_cache(
+        checkpoint, build_config(checkpoint.text_config), [(rows, 12)], tmp_path / "ple", torch.float32, block_rows=7
+    )
+    loaded = load_model(directory, tmp_path / "offload", dtype=torch.float32, cpu_budget_bytes=0, ple_cache=caches)
+    ids = torch.tensor([rows[0]["input_ids"] + [0] * 4])
+    mask = torch.tensor([[1] * 8 + [0] * 4])
+    with torch.no_grad():
+        torch.testing.assert_close(
+            loaded(ids, attention_mask=mask).logits, original(ids, attention_mask=mask).logits, rtol=1e-5, atol=1e-6
+        )
+    cached = next(module for module in loaded.modules() if isinstance(module, CachedEmbedding))
+    with pytest.raises(ValueError, match="cache miss"):
+        cached(torch.tensor([cached.weight.shape[0]]))
+    assert (
+        prepare_ple_cache(
+            checkpoint, build_config(checkpoint.text_config), [(rows, 12)], tmp_path / "ple", torch.float32
+        )
+        == caches
+    )
+    with pytest.raises(ValueError, match="identity/checksum"):
+        prepare_ple_cache(
+            checkpoint, build_config(checkpoint.text_config), [(rows, 12)], tmp_path / "ple", torch.float16
+        )
+
+
 def test_causality_across_qsa_and_gdn(source):
     _, model, _ = source
     ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]])
@@ -212,7 +244,7 @@ def test_reject_unconsumed_text_tensor(source, tmp_path):
         load_model(directory, tmp_path / "offload")
 
 
-@pytest.mark.parametrize("method", ["rtn", "gptq"])
+@pytest.mark.parametrize("method", ["rtn", "gptq", "resumable"])
 def test_calibration_cli(source, tmp_path, method):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -235,7 +267,7 @@ def test_calibration_cli(source, tmp_path, method):
         "--offload-dir",
         str(tmp_path / "offload"),
         "--method",
-        method,
+        "gptq" if method == "resumable" else method,
         "--device",
         "cpu",
         "--dtype",
@@ -245,10 +277,12 @@ def test_calibration_cli(source, tmp_path, method):
         "--cpu-memory-gib",
         "0.000001",
     ]
-    if method == "gptq":
+    if method != "rtn":
         data = tmp_path / "calibration.jsonl"
         data.write_text('{"text": "a b c a b c"}\n')
         arguments.extend(["--calibration-data", str(data), "--samples", "1", "--sequence-length", "8"])
+    if method == "resumable":
+        arguments.extend(["--checkpoint-dir", str(tmp_path / "stages"), "--ple-cache-dir", str(tmp_path / "ple")])
     quality = tmp_path / "quality.jsonl"
     quality.write_text('{"text": "c b a c b a"}\n')
     reports = tmp_path / "quality"
@@ -257,13 +291,34 @@ def test_calibration_cli(source, tmp_path, method):
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads((output / "calibration_manifest.json").read_text())
     assert report["quantized_projections"] == 18
-    assert report["method"] == method
+    assert report["method"] == ("gptq" if method == "resumable" else method)
     assert report["cuda_peak_allocated_bytes"] == 0
     comparison = json.loads((reports / "comparison.json").read_text())
     assert comparison == report["quality"]
     assert comparison["before"]["quantized_projections"] == 0
     assert comparison["after"]["quantized_projections"] == 18
     assert comparison["before"]["predicted_tokens"] == comparison["after"]["predicted_tokens"] == 5
+    if method == "resumable":
+        arguments.extend(["--resume"])
+        for option, directory in (
+            ("--save-path", "resumed"),
+            ("--offload-dir", "new-offload"),
+            ("--quality-report-dir", "new-quality"),
+        ):
+            arguments[arguments.index(option) + 1] = str(tmp_path / directory)
+        result = subprocess.run(arguments, capture_output=True, text=True, timeout=60, check=False)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Reusing validated floating baseline" in result.stdout
+        assert "Calibrating:" not in result.stderr
+        expected = {key: value for path in output.glob("*.safetensors") for key, value in load_file(path).items()}
+        actual = {
+            key: value
+            for path in (tmp_path / "resumed").glob("*.safetensors")
+            for key, value in load_file(path).items()
+        }
+        assert actual.keys() == expected.keys()
+        for key, value in actual.items():
+            torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -362,6 +417,130 @@ def test_sequential_gptq_export_and_native_bridge(source, tmp_path, device):
     assert result.returncode == 0, result.stdout + result.stderr
     with pytest.raises(ValueError, match="empty destination"):
         save_checkpoint(model, compressed)
+
+
+@pytest.mark.parametrize("interruption", ["committed", "uncommitted", "final"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_resumed_gptq_matches_uninterrupted(source, tmp_path, monkeypatch, interruption, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    from datasets import Dataset
+    from llmcompressor import oneshot
+    from llmcompressor.core import create_session
+    from llmcompressor.modifiers.gptq import GPTQModifier
+    from qwen38 import resume
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    directory, _, _ = source
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+    )
+    dataset = Dataset.from_dict(
+        {"input_ids": [[3, 4, 2, 5, 6, 7, 8, 9], [5, 6, 7, 8, 3, 4, 5, 6]], "attention_mask": [[1] * 8] * 2}
+    )
+
+    def run(name, store=None):
+        model = load_model(
+            directory,
+            tmp_path / name,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+            device=device,
+            cpu_budget_bytes=0,
+        )
+        if store:
+            model.stage_store = store
+        with create_session():
+            oneshot(
+                model=model,
+                tokenizer=tokenizer,
+                recipe=GPTQModifier(
+                    scheme="W8A8", targets=[r"re:.*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)"]
+                ),
+                dataset=dataset,
+                num_calibration_samples=2,
+                max_seq_length=8,
+                pipeline="qwen38_resumable" if store else "sequential",
+                sequential_targets=["Qwen4ExpTextDecoderLayer"],
+                sequential_offload_device="cpu",
+                moe_calibrate_all_experts=True,
+                shuffle_calibration_samples=False,
+                output_dir=None,
+                clear_sparse_session=True,
+            )
+        check_quantization(model, True)
+        return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+    expected = run("uninterrupted")
+    store = resume.StageStore(tmp_path / "stages", {"test": 1})
+    save = resume.StageStore.save
+    save_file_original = resume.save_file
+
+    def interrupted_save_file(tensors, filename, **kwargs):
+        save_file_original(tensors, filename, **kwargs)
+        if "stage-0001.tmp" in str(filename):
+            raise RuntimeError("simulated interrupted write")
+
+    def interrupted_save(self, model, graph, cache, index):
+        save(self, model, graph, cache, index)
+        if index == (2 if interruption == "final" else 1):
+            raise RuntimeError("simulated interrupted process")
+
+    if interruption == "uncommitted":
+        monkeypatch.setattr(resume, "save_file", interrupted_save_file)
+    else:
+        monkeypatch.setattr(resume.StageStore, "save", interrupted_save)
+    with pytest.raises(RuntimeError, match="simulated interrupted"):
+        run("interrupted", store)
+    count = len(store.progress["stages"])
+    assert count == {"committed": 2, "uncommitted": 1, "final": 3}[interruption]
+    store.close()
+    monkeypatch.setattr(resume.StageStore, "save", save)
+    monkeypatch.setattr(resume, "save_file", save_file_original)
+    restored = resume.StageStore(tmp_path / "stages", {"test": 1}, resume=True)
+    actual = run("resumed", restored)
+    assert len(restored.progress["stages"]) == 3
+    restored.close()
+    assert expected.keys() == actual.keys()
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0, msg=key)
+
+
+def test_resume_fingerprint_and_corruption_rejected(tmp_path):
+    from qwen38.resume import StageStore
+
+    store = StageStore(tmp_path / "stages", {"source": "original"})
+    with pytest.raises(BlockingIOError):
+        StageStore(tmp_path / "stages", {"source": "original"}, resume=True)
+    store.close()
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        StageStore(tmp_path / "stages", {"source": "changed"}, resume=True)
+    store = StageStore(tmp_path / "stages", {"source": "original"}, resume=True)
+    path = store.path / "stage-0000"
+    path.mkdir()
+    (path / "weights.safetensors").write_bytes(b"corrupted")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        store.checked_file({"directory": path.name, "files": {"weights.safetensors": "invalid"}}, "weights.safetensors")
+    store.close()
+
+
+def test_baseline_reuse_validation(source, tmp_path):
+    from qwen38.quality import validate_baseline
+
+    directory, _, _ = source
+    model = load_model(directory, tmp_path / "offload", dtype=torch.float32, cpu_budget_bytes=0)
+    rows = [{"input_ids": [3, 4, 5, 6], "attention_mask": [1] * 4}]
+    before = evaluate(model, rows, chunk_size=2)
+    validate_baseline(before, model, rows, "cpu", 2)
+    with pytest.raises(ValueError, match="baseline mismatch: logit_chunk_size"):
+        validate_baseline(before, model, rows, "cpu", 3)
+    with pytest.raises(ValueError, match="baseline mismatch: token_ids_sha256"):
+        validate_baseline(before, model, [{"input_ids": [3, 5, 4, 6]}], "cpu", 2)
+    with pytest.raises(ValueError, match="aggregate mismatch"):
+        validate_baseline({**before, "mean_nll": before["mean_nll"] + 1}, model, rows, "cpu", 2)
 
 
 @pytest.mark.parametrize("chunk_size", [1, 3, 128])
