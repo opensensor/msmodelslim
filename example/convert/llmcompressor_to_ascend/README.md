@@ -15,6 +15,10 @@ The intended workflow is:
 3. Run the CPU exporter below into a fresh directory.
 4. Validate loading, accuracy and generation on the intended vLLM-Ascend/310P stack.
 
+The [full-size Qwen3-8B RTX pilot](QWEN3_8B_PILOT.md) completed GPTQ calibration,
+native export, exact verification and a held-out reference quality comparison.
+It produced 9.45 GB of native tensor payload; actual Duo inference remains pending.
+
 ## Supported checkpoint contract
 
 | Source | Ascend output |
@@ -91,6 +95,71 @@ Python 3.14/Pydantic annotation failure encountered when importing LLM-Compresso
 
 ## Calibrate local floating-point weights
 
+### RTX conversion for Atlas 300I Duo
+
+The deployment target for this fork is the **96 GB Atlas 300I Duo: two Ascend
+310P chips, each with nominally 48 GB**. Each chip has its own memory budget.
+Use the actual available device memory reported on the Ascend host, then reserve
+space for KV cache, activations, communication, NZ padding and runtime workspaces.
+Do not divide checkpoint bytes by total card memory and call that a runtime fit.
+Tensor-parallel ranks refer to NPU devices: one Duo has two devices, two cards
+have four, and three cards have six. Valid parallel sizes also depend on the
+model's attention heads, expert layout and supported communication topology.
+
+Build a separate CUDA environment for the RTX conversion host:
+
+```bash
+uv venv --python 3.12 .venv-cuda
+uv pip install --python .venv-cuda/bin/python torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu130
+uv pip install --python .venv-cuda/bin/python -r example/convert/llmcompressor_to_ascend/requirements-cpu.txt
+uv pip install --python .venv-cuda/bin/python --no-deps -e . -e ../llm-compressor -e ../compressed-tensors
+```
+
+Use the same pinned dependency checkouts, disk-cache patch and package-data links
+as the CPU setup. The requirements file provides the shared Python dependencies;
+PyTorch and torchvision come from the CUDA index here. CUDA's Triton package is
+for the conversion host only; it is not a dependency to install on the Duo.
+
+```bash
+OMP_NUM_THREADS=8 .venv-cuda/bin/python \
+  example/convert/llmcompressor_to_ascend/quantize_w8a8.py \
+  --model-path /path/to/original-floating-point-model \
+  --save-path /path/to/fresh-compressed-w8a8 \
+  --offload-dir /path/to/fresh-scratch \
+  --method gptq --device cuda --dtype float16 --target atlas-300i-duo \
+  --cpu-memory-gib 64 --calibration-data /path/to/calibration.jsonl \
+  --samples 128 --sequence-length 1024
+```
+
+This target profile requires explicit FP16 loading for floating-point runtime
+tensors. It records the intended hardware; it does not change dynamic W8A8 into
+W8A8SC or certify a particular model/kernel. Both RTN and GPTQ explicitly execute
+on the selected device while retaining CPU/disk weight storage. The manifest
+records elapsed time, GPU identity and PyTorch peak allocated/reserved bytes.
+Those GPU figures exclude driver and non-PyTorch allocations and are not Ascend
+runtime memory estimates. The existing CPU command still runs with CUDA hidden.
+
+Run the GPU integration checks only when the GPU is available for this work:
+
+```bash
+OMP_NUM_THREADS=2 .venv-cuda/bin/python -m pytest -q \
+  test/integration/test_calibration_workflow.py -k cuda
+```
+
+After conversion, use the CPU export and value verifier below. Initial Duo
+deployment should explicitly select FP16, a bounded context length and low
+concurrency. Measure single-chip execution first for models that fit, then
+compare two-chip parallelism with independent replicas. Acceptance requires
+actual 310P loading, held-out numerical/quality checks, prefill and decode
+throughput, and per-chip peak memory. NVIDIA conversion success alone does not
+satisfy those checks. The local dynamic INT8 kernel's documented accuracy issue
+remains a reason to compare against existing W8A8SC checkpoints on the NPU.
+
+References: [official Ascend Duo memory discussion](https://www.hiascend.com/developer/techArticles/20251212-1?envFlag=1),
+[vLLM-Ascend 310P deployment guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0rc1/tutorials/hardwares/310p.html).
+
+### Shared calibration options
+
 `quantize_w8a8.py` prepares the compressed-tensors input for the exporter. It loads
 local safetensors and tokenizer files without remote code, uses CPU/disk weight
 placement with a configurable budget, and invokes sequential GPTQ calibration.
@@ -150,6 +219,32 @@ disk. Keep intermediate weights and scratch files until validation is complete.
 The manifest records calibration completion, not Ascend inference compatibility.
 
 ## Verify exported checkpoints
+
+### Check reference quality
+
+`evaluate_w8a8.py` measures all-token next-token perplexity on local held-out
+JSONL records using Transformers. Run it once on the original weights and once
+on the compressed-tensors intermediate, with the same records and limits:
+
+```bash
+OMP_NUM_THREADS=8 .venv-cuda/bin/python \
+  example/convert/llmcompressor_to_ascend/evaluate_w8a8.py \
+  --model-path /path/to/compressed-w8a8 \
+  --calibration-data /path/to/heldout.jsonl --report /path/to/fresh-quality.json \
+  --device cuda --samples 32 --sequence-length 1024
+```
+
+Despite the shared `--calibration-data` option name, use records excluded from
+calibration here. Compare only reports with identical `token_ids_sha256` and
+`predicted_tokens`. The metric includes both user and assistant tokens; it is
+not an assistant-only benchmark. Compressed checkpoints run through
+compressed-tensors quantize/dequantize reference operations, with dynamic INT8
+activation quantization enabled. The entire decompressed model must fit on the
+selected device. This command currently uses FP16 and does not use the offload
+calibration path. Native Ascend output is rejected: quality measurements here
+do not establish 310P kernel parity or validate unrelated model architectures.
+
+### Check export integrity
 
 Every W8A8 import now validates its completed checkpoint inventory, shard index,
 tensor shapes/dtypes, per-tensor quantization tags and model configuration before

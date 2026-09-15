@@ -304,6 +304,7 @@ assert len([n for n, p in unpacked.named_parameters() if '.experts.' in n and n.
         ("quantized_source", "already quantized"),
         ("bad_budget", "finite positive"),
         ("rtn_data", "RTN is data-free"),
+        ("duo_dtype", "requires --dtype float16"),
     ],
 )
 def test_rejects_bad_calibration_jobs_before_loading_model(tmp_path, case, message):
@@ -334,6 +335,8 @@ def test_rejects_bad_calibration_jobs_before_loading_model(tmp_path, case, messa
         extra += ["--cpu-memory-gib", "nan"]
     elif case == "rtn_data":
         extra += ["--method", "rtn"]
+    elif case == "duo_dtype":
+        extra += ["--target", "atlas-300i-duo"]
     result = run(
         [
             sys.executable,
@@ -356,3 +359,112 @@ def test_rejects_bad_calibration_jobs_before_loading_model(tmp_path, case, messa
         assert (output / "keep").read_text() == "original"
     else:
         assert not output.exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an explicitly visible CUDA GPU")
+@pytest.mark.parametrize("method", ["rtn", "gptq"])
+def test_cuda_calibration_for_duo_then_cpu_export(tmp_path, method):
+    source, compressed, ascend = tmp_path / "source", tmp_path / "compressed", tmp_path / "ascend"
+    create_source(source)
+    command = [
+        sys.executable,
+        str(EXAMPLE / "quantize_w8a8.py"),
+        "--model-path",
+        str(source),
+        "--save-path",
+        str(compressed),
+        "--offload-dir",
+        str(tmp_path / "offload"),
+        "--method",
+        method,
+        "--device",
+        "cuda",
+        "--dtype",
+        "float16",
+        "--target",
+        "atlas-300i-duo",
+    ]
+    if method == "gptq":
+        data = tmp_path / "data.jsonl"
+        data.write_text('{"text": "t2 t3 t4 t5 t6 t7 t8 t9"}\n' * 4)
+        command += ["--calibration-data", str(data), "--samples", "4", "--sequence-length", "8"]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads((compressed / "calibration_manifest.json").read_text())
+    assert manifest["cuda_peak_allocated_bytes"] > 0
+    assert manifest["cuda_peak_reserved_bytes"] >= manifest["cuda_peak_allocated_bytes"]
+    assert manifest["accelerator"]["name"]
+    assert manifest["elapsed_seconds"] > 0
+    assert manifest["target"]["chips_per_card"] == 2
+    assert manifest["target"]["nominal_memory_gb_per_chip"] == 48
+    assert manifest["target"]["memory_is_pooled"] is False
+    assert manifest["target"]["ascend_inference_validated"] is False
+    result = run(
+        [
+            str(Path(sys.executable).parent / "msmodelslim"),
+            "quant",
+            "--device",
+            "cpu",
+            "--model_path",
+            str(compressed),
+            "--save_path",
+            str(ascend),
+            "--config",
+            str(EXAMPLE / "w8a8_dynamic.yaml"),
+        ]
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert verify(compressed, ascend, check_values=True)["quantized_linears"] == 7
+    assert read_tensors(ascend)["lm_head.weight"].dtype == torch.float16
+
+
+def test_heldout_reference_evaluation(tmp_path):
+    source, compressed = tmp_path / "source", tmp_path / "compressed"
+    create_source(source)
+    result = run(
+        [
+            sys.executable,
+            str(EXAMPLE / "quantize_w8a8.py"),
+            "--model-path",
+            str(source),
+            "--save-path",
+            str(compressed),
+            "--offload-dir",
+            str(tmp_path / "offload"),
+            "--method",
+            "rtn",
+            "--dtype",
+            "float16",
+        ]
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    data = tmp_path / "heldout.jsonl"
+    data.write_text('{"text": "t2 t4 t6 t8 t10 t12"}\n' * 2)
+    reports = []
+    for path, count in [(source, 0), (compressed, 7)]:
+        report_path = tmp_path / (path.name + '.json')
+        result = run(
+            [
+                sys.executable,
+                str(EXAMPLE / "evaluate_w8a8.py"),
+                "--model-path",
+                str(path),
+                "--calibration-data",
+                str(data),
+                "--report",
+                str(report_path),
+                "--samples",
+                "2",
+                "--sequence-length",
+                "6",
+            ]
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        report = json.loads(report_path.read_text())
+        assert report["quantized_modules"] == count
+        assert report["predicted_tokens"] == 10
+        assert report["perplexity"] > 1
+        assert report["ascend_inference_validated"] is False
+        reports.append(report)
+    assert reports[0]["token_ids_sha256"] == reports[1]["token_ids_sha256"]
+    assert reports[0]["mean_nll"] != reports[1]["mean_nll"]

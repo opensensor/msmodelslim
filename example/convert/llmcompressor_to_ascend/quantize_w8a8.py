@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import time
 from importlib.metadata import version
 from pathlib import Path
 
@@ -39,6 +40,12 @@ def parse_args(argv=None):
     parser.add_argument("--method", choices=("gptq", "rtn"), default="gptq")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument(
+        "--target",
+        choices=("generic", "atlas-300i-duo"),
+        default="generic",
+        help="Record the deployment target; atlas-300i-duo requires explicit --dtype float16",
+    )
     parser.add_argument(
         "--cpu-memory-gib",
         type=positive_gib,
@@ -70,6 +77,8 @@ def parse_args(argv=None):
 
 
 def validate_paths(args):
+    if args.target == "atlas-300i-duo" and args.dtype != "float16":
+        raise ValueError("atlas-300i-duo requires --dtype float16 for floating-point runtime tensors")
     paths = [args.model_path.resolve(), args.save_path.resolve(), args.offload_dir.resolve()]
     for index, path in enumerate(paths):
         for other in paths[index + 1 :]:
@@ -125,12 +134,13 @@ def read_calibration(args):
 
 
 def quantize(args):
+    started = time.monotonic()
     if args.device == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     # Optional dependencies and accelerator discovery occur only after CPU isolation.
     import torch
-    from compressed_tensors.offload import get_offloaded_device
+    from compressed_tensors.offload import get_offloaded_device, set_onload_device
     from datasets import Dataset
     from llmcompressor import oneshot
     from llmcompressor.modifiers.gptq import GPTQModifier
@@ -142,6 +152,14 @@ def quantize(args):
         raise RuntimeError("--device cuda requires a CUDA-enabled PyTorch environment and a visible GPU")
     if args.device == "cpu" and torch.accelerator.is_available():
         raise RuntimeError("CPU mode requires accelerator isolation; another accelerator is still visible")
+    accelerator = None
+    if args.device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        accelerator = {
+            "name": torch.cuda.get_device_name(),
+            "capability": list(torch.cuda.get_device_capability()),
+            "total_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
+        }
     # This is a PTQ-only process. In particular, disk-cache dtype conversions
     # must not build autograd graphs during the save/restore offload round trip.
     torch.set_grad_enabled(False)
@@ -176,6 +194,9 @@ def quantize(args):
             offload_folder=str(args.offload_dir),
         )
     disk_modules = [name for name, module in model.named_modules() if get_offloaded_device(module) == "disk"]
+    # Set execution placement explicitly for both sequential GPTQ and data-free
+    # RTN. Weight storage remains CPU/disk under the placement budget above.
+    set_onload_device(model, args.device)
     ignores = list(DEFAULT_IGNORES) + args.ignore
     recipe = (GPTQModifier if args.method == "gptq" else QuantizationModifier)(
         scheme="W8A8",
@@ -208,6 +229,17 @@ def quantize(args):
         "scheme": "W8A8",
         "device": args.device,
         "dtype": args.dtype,
+        "target": {
+            "name": args.target,
+            "chips_per_card": 2 if args.target == "atlas-300i-duo" else None,
+            "nominal_memory_gb_per_chip": 48 if args.target == "atlas-300i-duo" else None,
+            "memory_is_pooled": False if args.target == "atlas-300i-duo" else None,
+            "ascend_inference_validated": False,
+        },
+        "elapsed_seconds": time.monotonic() - started,
+        "accelerator": accelerator,
+        "cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated() if args.device == "cuda" else 0,
+        "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved() if args.device == "cuda" else 0,
         "seed": args.seed,
         "model_type": model.config.model_type,
         "cpu_weight_budget_bytes": int(args.cpu_memory_gib * GIB),
